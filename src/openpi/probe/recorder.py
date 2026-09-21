@@ -1,45 +1,56 @@
-"""Writes captured activations to disk.
+"""Writes captured activations to disk: one safetensors file per inference call.
 
-    with recorder.ActivationRecorder(policy, "probe_data/raw", config=capture.CaptureConfig.pilot()) as rec:
-        for obs in observations:
+    rec = recorder.ActivationRecorder(policy, "probe_data/run1")
+    for episode in recorded_episodes:
+        rec.reset()                          # the next call starts a new ep_ folder
+        for obs in episode:
             rec.infer(obs)
 
-    out_dir/
-      capture_meta.json     # per-site axes / shapes / dtypes / axis ids, and the row count
-      shard_000000.npz      # stacked arrays, first axis is the row
-      shard_000001.npz
+    probe_data/run1/
+      meta.json                              # what each key is: axes, shape, dtype, layer ids
+      ep_00000/t_00000.safetensors           # episode 0, inference call 0
+      ep_00000/t_00001.safetensors
+      ep_00001/t_00000.safetensors
       ...
 
-Rows are in call order, and shards are in name order, so row i of the whole run is row
-`i % flush_every` of shard `i // flush_every`. Nothing about episodes, timesteps or
-rollout structure is recorded: this only caches the vectors.
+Each file is a flat dict {site: tensor} with the batch axis dropped and bfloat16 kept as
+bfloat16, so reading one back is a single call:
 
-Read it back with `load_site`:
+    from safetensors.torch import load_file
+    step = load_file("probe_data/run1/ep_00003/t_00017.safetensors")
+    step["prefix_image"]                     # torch.bfloat16 [19, 3, 256, 2048]
 
-    hidden = load_site("probe_data/raw", "suffix_hidden")   # [N, layer, step, token, dim]
+`load_episode` stacks a whole episode along a new leading time axis.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 import contextlib
 import json
 import logging
 import pathlib
 from typing import Any
 
-import numpy as np
 from openpi_client import base_policy as _base_policy
+import safetensors
+import safetensors.torch
+import torch
 
 from openpi.probe import capture as _capture
-from openpi.probe import codec
 
 logger = logging.getLogger("openpi")
 
-META_FILENAME = "capture_meta.json"
+META_FILENAME = "meta.json"
+
+
+def episode_dir(out_dir: str | pathlib.Path, episode: int) -> pathlib.Path:
+    """Folder holding one episode's files."""
+    return pathlib.Path(out_dir) / f"ep_{episode:05d}"
 
 
 class ActivationRecorder(_base_policy.BasePolicy):
-    """Runs each `infer` under a capture session and buffers the result into shards."""
+    """Runs each `infer` under a capture session and writes that call to its own file."""
 
     def __init__(
         self,
@@ -47,37 +58,27 @@ class ActivationRecorder(_base_policy.BasePolicy):
         out_dir: str | pathlib.Path,
         *,
         config: _capture.CaptureConfig | None = None,
-        enabled: bool = True,
-        flush_every: int = 32,
         extra_meta: dict[str, Any] | None = None,
     ):
         """
         Args:
-            policy: Policy to wrap. When disabled, `infer` is forwarded unchanged.
-            out_dir: Where the shards and capture_meta.json go.
-            config: What to capture. Defaults to `CaptureConfig()`.
-            enabled: Master switch. False makes this a transparent pass-through, so it is
-                safe to leave wired into an eval script permanently.
-            flush_every: Rows per shard. Peak RAM is about this times the per-row size, and
-                a crash loses at most this many rows.
-            extra_meta: Written verbatim into capture_meta.json (checkpoint id, git sha...).
+            policy: Policy to wrap.
+            out_dir: Run directory. It must not already hold episodes, so two runs never
+                mix in one folder.
+            config: What to capture. Defaults to the mid preset, `CaptureConfig.mid()`.
+            extra_meta: Written verbatim into meta.json (checkpoint id, git sha...).
         """
         self._policy = policy
-        self._enabled = enabled
-        self._config = config or _capture.CaptureConfig()
-        self._flush_every = int(flush_every)
+        self._config = config or _capture.CaptureConfig.mid()
         self._extra_meta = dict(extra_meta or {})
 
         self._out_dir = pathlib.Path(out_dir)
-        self._buffers: dict[str, list[np.ndarray]] = {}
-        self._buffered = 0
-        self._num_rows = 0
-        self._shard_idx = 0
+        self._episode = 0
+        self._step = 0
         self._site_meta: dict[str, dict] | None = None
 
-        if not enabled:
-            return
-
+        if any(self._out_dir.glob("ep_*")):
+            raise FileExistsError(f"{self._out_dir} already holds episodes; record each run into a new directory")
         self._out_dir.mkdir(parents=True, exist_ok=True)
         if _disable_torch_compile(policy):
             logger.warning(
@@ -87,76 +88,49 @@ class ActivationRecorder(_base_policy.BasePolicy):
             )
 
     @property
-    def num_rows(self) -> int:
-        """Inference calls recorded so far, flushed or not."""
-        return self._num_rows
-
-    @property
     def metadata(self) -> dict[str, Any]:
         return getattr(self._policy, "metadata", {})
 
+    def reset(self) -> None:
+        """Starts a new episode and resets the wrapped policy.
+
+        A reset before the current episode has any steps does not advance the episode, so
+        calling this at the start of every episode never leaves an empty folder.
+        """
+        self._policy.reset()
+        if self._step > 0:
+            self._episode += 1
+            self._step = 0
+
     def infer(self, obs: dict, **kwargs: Any) -> dict:  # type: ignore[override]
-        """Runs the wrapped policy and caches the activations from that call.
+        """Runs the wrapped policy and writes the activations from that call to one file.
 
         Extra keyword arguments are forwarded to the policy, so `noise=` still works if you
         want to control the flow-matching noise yourself.
         """
-        if not self._enabled:
-            return self._policy.infer(obs, **kwargs)
-
         with _capture.session(self._config) as cap:
             outputs = self._policy.infer(obs, **kwargs)
-            arrays, site_meta = cap.result()
+            tensors, site_meta = cap.result()
 
         if self._site_meta is None:
             self._site_meta = site_meta
             self._write_meta()
         elif site_meta != self._site_meta:
-            # Shapes must stay constant or the shards cannot be concatenated. This catches a
+            # Shapes must stay constant or an episode cannot be stacked. This catches a
             # changed camera count or prompt length rather than letting it corrupt the run.
             raise RuntimeError(f"Capture layout changed mid-run: expected {self._site_meta}, got {site_meta}")
 
+        path = episode_dir(self._out_dir, self._episode) / f"t_{self._step:05d}.safetensors"
+        path.parent.mkdir(exist_ok=True)
         # Policy.infer always works on a batch of one (it adds that axis itself), so drop it.
-        for site, array in arrays.items():
-            self._buffers.setdefault(site, []).append(array[0])
-        self._buffered += 1
-        self._num_rows += 1
-
-        if self._buffered >= self._flush_every:
-            self.flush()
+        safetensors.torch.save_file({site: tensor[0] for site, tensor in tensors.items()}, str(path))
+        self._step += 1
         return outputs
 
-    def flush(self) -> None:
-        """Writes the buffered rows as one shard."""
-        if not self._buffered:
-            return
-        path = self._out_dir / f"shard_{self._shard_idx:06d}.npz"
-        # Uncompressed on purpose: activations barely compress, so savez_compressed would
-        # only burn CPU.
-        np.savez(path, **{site: np.stack(chunks, axis=0) for site, chunks in self._buffers.items()})
-        logger.info("Probe capture: wrote %s (%d rows)", path.name, self._buffered)
-        self._shard_idx += 1
-        self._buffered = 0
-        self._buffers = {}
-        self._write_meta()
-
-    def close(self) -> None:
-        if self._enabled:
-            self.flush()
-
-    def __enter__(self) -> ActivationRecorder:
-        return self
-
-    def __exit__(self, *exc_info) -> None:
-        self.close()
-
     def _write_meta(self) -> None:
-        """Rewritten after every flush so the row count on disk stays current."""
         meta = {
-            "format_version": 2,
-            "num_rows": self._num_rows - self._buffered,  # only what is actually on disk
-            "num_shards": self._shard_idx,
-            "flush_every": self._flush_every,
+            "format_version": 3,
+            "layout": "ep_XXXXX/t_XXXXX.safetensors: one file per inference call, batch axis dropped",
             "capture_config": {
                 "sites": sorted(self._config.sites),
                 "prefix_layers": self._config.prefix_layers,
@@ -167,34 +141,36 @@ class ActivationRecorder(_base_policy.BasePolicy):
             **self._extra_meta,
         }
         (self._out_dir / META_FILENAME).write_text(
-            json.dumps(meta, indent=2, default=_json_default, ensure_ascii=False), encoding="utf-8"
+            json.dumps(meta, indent=2, default=str, ensure_ascii=False), encoding="utf-8"
         )
 
 
 def load_meta(out_dir: str | pathlib.Path) -> dict:
-    """Reads capture_meta.json."""
+    """Reads meta.json."""
     return json.loads((pathlib.Path(out_dir) / META_FILENAME).read_text(encoding="utf-8"))
 
 
-def load_site(out_dir: str | pathlib.Path, site: str, *, decode: bool = True) -> np.ndarray:
-    """Concatenates one site across every shard, in call order.
+def load_episode(
+    out_dir: str | pathlib.Path, episode: int, sites: Iterable[str] | None = None
+) -> dict[str, torch.Tensor]:
+    """Loads one episode as {site: tensor[T, ...]}, steps stacked in call order.
 
-    With `decode=True` bfloat16 sites come back as float32; with False you get the raw
-    int16 bit patterns, which is half the memory if you only need to move them around.
+    bfloat16 sites stay bfloat16. `sites` limits which keys are read, so loading only the
+    small sites never touches the large ones on disk.
     """
-    out_dir = pathlib.Path(out_dir)
-    meta = load_meta(out_dir)
-    if site not in meta["sites"]:
-        raise ValueError(f"Site {site!r} was not captured; available: {sorted(meta['sites'])}")
+    files = sorted(episode_dir(out_dir, episode).glob("t_*.safetensors"))
+    if not files:
+        raise FileNotFoundError(f"No steps found for episode {episode} in {out_dir}")
 
-    blocks = []
-    for path in sorted(out_dir.glob("shard_*.npz")):
-        with np.load(path) as npz:
-            blocks.append(npz[site])
-    if not blocks:
-        raise FileNotFoundError(f"No shards found in {out_dir}")
-    array = np.concatenate(blocks, axis=0)
-    return codec.decode(array, meta["sites"][site]["store_dtype"]) if decode else array
+    steps = []
+    for path in files:
+        with safetensors.safe_open(str(path), framework="pt") as f:
+            available = set(f.keys())
+            wanted = sorted(available) if sites is None else list(sites)
+            if missing := set(wanted) - available:
+                raise ValueError(f"Site(s) {sorted(missing)} were not captured; available: {sorted(available)}")
+            steps.append({site: f.get_tensor(site) for site in wanted})
+    return {site: torch.stack([step[site] for step in steps]) for site in steps[0]}
 
 
 def _disable_torch_compile(policy) -> bool:
@@ -213,11 +189,3 @@ def _disable_torch_compile(policy) -> bool:
     if getattr(policy, "_sample_actions", None) is compiled:
         policy._sample_actions = original  # noqa: SLF001
     return True
-
-
-def _json_default(value):
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    return str(value)

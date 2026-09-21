@@ -240,7 +240,7 @@ class PI0Pytorch(nn.Module):
         bsize = pad_masks.shape[0]
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
-        _capture.record_prefix_layout(image_spans, lang_span, pad_masks)
+        _capture.record_prefix_layout(image_spans, lang_span)
 
         return embs, pad_masks, att_masks
 
