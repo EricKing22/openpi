@@ -7,6 +7,8 @@ from transformers import PaliGemmaForConditionalGeneration
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
 
+from openpi.probe import capture as _capture
+
 
 class PaliGemmaWithExpertModel(nn.Module):
     def __init__(
@@ -106,8 +108,11 @@ class PaliGemmaWithExpertModel(nn.Module):
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 adarms_cond=adarms_cond[0] if adarms_cond is not None else None,
+                output_hidden_states=_capture.wants_prefix_hidden(),
             )
             prefix_past_key_values = prefix_output.past_key_values
+            if prefix_output.hidden_states is not None:
+                _capture.record_prefix_hidden(prefix_output.hidden_states)
             prefix_output = prefix_output.last_hidden_state
             suffix_output = None
         elif inputs_embeds[0] is None:
@@ -118,7 +123,10 @@ class PaliGemmaWithExpertModel(nn.Module):
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 adarms_cond=adarms_cond[1] if adarms_cond is not None else None,
+                output_hidden_states=_capture.wants_suffix_hidden(),
             )
+            if suffix_output.hidden_states is not None:
+                _capture.record_suffix_hidden(suffix_output.hidden_states)
             suffix_output = suffix_output.last_hidden_state
             prefix_output = None
             prefix_past_key_values = None

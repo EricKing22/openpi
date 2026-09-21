@@ -9,6 +9,7 @@ import torch.nn.functional as F  # noqa: N812
 import openpi.models.gemma as _gemma
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
+from openpi.probe import capture as _capture
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -193,6 +194,8 @@ class PI0Pytorch(nn.Module):
         embs = []
         pad_masks = []
         att_masks = []
+        image_spans = []
+        prefix_offset = 0
 
         # Process images
         for img, img_mask in zip(images, img_masks, strict=True):
@@ -201,11 +204,14 @@ class PI0Pytorch(nn.Module):
                 return self.paligemma_with_expert.embed_image(img)
 
             img_emb = self._apply_checkpoint(image_embed_func, img)
+            _capture.record("siglip_tokens", img_emb)
 
             bsize, num_img_embs = img_emb.shape[:2]
 
             embs.append(img_emb)
             pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
+            image_spans.append((prefix_offset, prefix_offset + num_img_embs))
+            prefix_offset += num_img_embs
 
             # Create attention masks so that image tokens attend to each other
             att_masks += [0] * num_img_embs
@@ -224,6 +230,7 @@ class PI0Pytorch(nn.Module):
         # full attention between image and language inputs
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
+        lang_span = (prefix_offset, prefix_offset + num_lang_embs)
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
@@ -232,6 +239,8 @@ class PI0Pytorch(nn.Module):
         # Get batch size from the first dimension of the concatenated tensors
         bsize = pad_masks.shape[0]
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
+
+        _capture.record_prefix_layout(image_spans, lang_span, pad_masks)
 
         return embs, pad_masks, att_masks
 
@@ -296,6 +305,7 @@ class PI0Pytorch(nn.Module):
             time_emb = self._apply_checkpoint(time_mlp_func, time_emb)
             action_time_emb = action_emb
             adarms_cond = time_emb
+            _capture.record("adarms_cond", adarms_cond)
 
         # Add to input tokens
         embs.append(action_time_emb)
@@ -382,6 +392,8 @@ class PI0Pytorch(nn.Module):
             noise = self.sample_noise(actions_shape, device)
 
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
+        _capture.set_action_horizon(self.config.action_horizon)
+        _capture.record_observation(lang_tokens, lang_masks, img_masks, state)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
@@ -404,7 +416,10 @@ class PI0Pytorch(nn.Module):
 
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
+        denoise_step_index = 0
         while time >= -dt / 2:
+            _capture.set_denoise_step(denoise_step_index)
+            _capture.record("xt_traj", x_t)
             expanded_time = time.expand(bsize)
             v_t = self.denoise_step(
                 state,
@@ -413,10 +428,13 @@ class PI0Pytorch(nn.Module):
                 x_t,
                 expanded_time,
             )
+            _capture.record("vt", v_t)
 
             # Euler step - use new tensor assignment instead of in-place operation
             x_t = x_t + dt * v_t
             time += dt
+            denoise_step_index += 1
+        _capture.record("xt_traj", x_t)
         return x_t
 
     def denoise_step(
