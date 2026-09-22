@@ -85,21 +85,37 @@ def catalog(root: str | Path, task: str | None = None) -> list[Sample]:
     return samples
 
 
+def to_numpy(tensor):
+    """`.npy` has no bfloat16, so such tensors are stored as their uint16 bit pattern."""
+    import torch
+
+    if tensor.dtype is torch.bfloat16:
+        return tensor.view(torch.uint16).numpy()
+    return tensor.numpy()
+
+
 class CachedAstraDataset:
-    """Lazy per-request tensor reader for the cache written by `scripts/cache_astra.py`."""
+    """Lazy per-request tensor reader for the cache written by `scripts/cache_astra.py`.
+
+    Each site is one memory-mapped `<site>.npy` whose row i is request i, so a sample
+    reads only the rows it needs and `samples.jsonl` row i describes it.
+    """
 
     def __init__(self, root: str | Path, sites: list[str] | None = None):
         self.root = Path(root).expanduser().resolve()
-        self.sites = sites
         self.rows = [json.loads(line) for line in (self.root / "samples.jsonl").read_text().splitlines() if line]
+        self.bfloat16_sites = set(json.loads((self.root / "meta.json").read_text())["bfloat16_sites"])
+        paths = [self.root / f"{site}.npy" for site in sites] if sites else sorted(self.root.glob("*.npy"))
+        self.arrays = {path.stem: np.load(path, mmap_mode="r") for path in paths}
 
     def __len__(self):
         return len(self.rows)
 
     def __getitem__(self, index):
-        from safetensors import safe_open
+        import torch
 
-        row = self.rows[index]
-        with safe_open(str(self.root / row["token_path"]), framework="pt") as handle:
-            features = {key: handle.get_tensor(key) for key in (self.sites or handle.keys())}
-        return {"features": features, "label": row["label"], "info": row}
+        features = {}
+        for site, array in self.arrays.items():
+            tensor = torch.from_numpy(np.array(array[index]))
+            features[site] = tensor.view(torch.bfloat16) if site in self.bfloat16_sites else tensor
+        return {"features": features, "label": self.rows[index]["label"], "info": self.rows[index]}

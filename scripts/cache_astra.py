@@ -35,28 +35,45 @@ def run(args):
 
     from openpi.policies import policy_config
     from openpi.probe import capture
-    from openpi.probe import recorder
+    from openpi.probe.astra import to_numpy
     from openpi.training import config
 
     output = args.output.expanduser().resolve()
+    output.mkdir(parents=True, exist_ok=True)
     cfg = config.get_config(args.config)
+    capture_config = capture.CaptureConfig.high()
     policy = policy_config.create_trained_policy(
         cfg, args.checkpoint.expanduser().resolve(), sample_kwargs={"num_steps": args.num_steps}
     )
-    activations = recorder.ActivationRecorder(
-        policy,
-        output,
-        config=capture.CaptureConfig.high(),
-        extra_meta={"config": args.config, "checkpoint": str(args.checkpoint), "seed": args.seed},
-    )
     rng = np.random.default_rng(args.seed)
-    rows = []
+    arrays, rows = {}, []
     for index, sample in enumerate(samples):
         noise = rng.standard_normal((cfg.model.action_horizon, cfg.model.action_dim), dtype=np.float32)
-        with torch.inference_mode():
-            activations.infer(sample.observation(root), noise=noise)
-        token_path = recorder.episode_dir(output, 0).relative_to(output) / f"t_{index:05d}.safetensors"
-        rows.append(dict(sample.info, token_path=token_path.as_posix(), request=sample.request))
+        with torch.inference_mode(), capture.session(capture_config) as session:
+            policy.infer(sample.observation(root), noise=noise)
+            captured, sites = session.result()
+        # Policy.infer works on a batch of one, so drop that axis.
+        request = {site: to_numpy(tensor[0]) for site, tensor in captured.items()}
+        if not arrays:
+            # One file per site, row i being request i. Preallocated, so each request is
+            # written in place and only that request is ever in memory.
+            arrays = {
+                site: np.lib.format.open_memmap(
+                    output / f"{site}.npy", mode="w+", shape=(len(samples), *array.shape), dtype=array.dtype
+                )
+                for site, array in request.items()
+            }
+            meta = {
+                "sites": sites,
+                "bfloat16_sites": sorted(s for s, t in captured.items() if t.dtype is torch.bfloat16),
+                "config": args.config,
+                "checkpoint": str(args.checkpoint),
+                "seed": args.seed,
+            }
+            (output / "meta.json").write_text(json.dumps(meta, indent=2, default=str), encoding="utf-8")
+        for site, array in request.items():
+            arrays[site][index] = array
+        rows.append(dict(sample.info, request=sample.request))
         print(f"Cached {index + 1}/{len(samples)}: {sample.info['episode_id']} request {sample.info['request_id']}")
     (output / "samples.jsonl").write_text(
         "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8"
