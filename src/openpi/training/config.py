@@ -570,6 +570,15 @@ _CONFIGS = [
         policy_metadata={"reset_pose": [0, -1.5, 1.5, 0, 0, 0]},
     ),
     TrainConfig(
+        name="pi05_robodojo",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=50, pytorch_compile_mode=None),
+        data=LeRobotAlohaDataConfig(
+            assets=AssetsConfig(asset_id="arx_x5_sim"),
+            adapt_to_pi=False,
+            use_delta_joint_actions=True,
+        ),
+    ),
+    TrainConfig(
         name="pi05_aloha",
         model=pi0_config.Pi0Config(pi05=True),
         data=LeRobotAlohaDataConfig(
